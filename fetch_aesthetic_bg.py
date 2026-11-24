@@ -85,17 +85,20 @@ def require_deps() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def search(query: str, n: int) -> list[dict]:
-    """Возвращает метаданные кандидатов по запросу (без скачивания видео)."""
-    cmd = [
-        sys.executable, "-m", "yt_dlp",
-        "--skip-download", "--dump-json", "--no-warnings", "--ignore-errors",
-        f"ytsearch{n}:{query} #shorts",
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+def run_yt(args: list[str], timeout: int) -> subprocess.CompletedProcess | None:
+    """Запуск yt-dlp с таймаутом, чтобы скрипт не зависал на сетевых запросах."""
+    cmd = [sys.executable, "-m", "yt_dlp", "--no-warnings", "--ignore-errors", *args]
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log("   ! yt-dlp не ответил за отведённое время, пропускаю")
+        return None
 
+
+def parse_json_lines(text: str) -> list[dict]:
     items: list[dict] = []
-    for line in proc.stdout.splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -103,12 +106,36 @@ def search(query: str, n: int) -> list[dict]:
             items.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+    return items
 
+
+def search_flat(query: str, n: int) -> list[dict]:
+    """Быстрый поиск: только id, название и длительность (без полной загрузки каждого ролика)."""
+    proc = run_yt(["--flat-playlist", "--dump-json", f"ytsearch{n}:{query} #shorts"], timeout=180)
+    if proc is None:
+        return []
+    items = parse_json_lines(proc.stdout)
     if proc.returncode != 0 and not items:
         tail = (proc.stderr or "").strip()[-300:]
         log(f"   ! поиск завершился с ошибкой: {tail}")
         SEARCH_ERRORS.append(tail)
     return items
+
+
+def fetch_info(video_id: str) -> dict | None:
+    """Полные метаданные одного ролика: размеры, лицензия."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    proc = run_yt(["--skip-download", "--dump-json", "--no-playlist", url], timeout=90)
+    if proc is None:
+        return None
+    items = parse_json_lines(proc.stdout)
+    return items[0] if items else None
+
+
+def is_short_enough(entry: dict) -> bool:
+    """Предварительный фильтр по длительности из быстрого поиска (если известна)."""
+    dur = entry.get("duration")
+    return dur is None or SRC_MIN_SEC <= float(dur) <= SRC_MAX_SEC
 
 
 def is_good_candidate(info: dict, any_license: bool) -> bool:
@@ -156,14 +183,14 @@ def interleave(pools: list[tuple[str, list[dict]]]) -> list[tuple[str, dict]]:
 def download(video_id: str, tmp: Path) -> Path | None:
     """Скачивает видеодорожку (звук нам не нужен) во временную папку."""
     url = f"https://www.youtube.com/watch?v={video_id}"
-    cmd = [
-        sys.executable, "-m", "yt_dlp",
-        "--no-playlist", "--no-warnings",
+    proc = run_yt([
+        "--no-playlist",
         "-f", "bv*[ext=mp4][height>=1080]/bv*[ext=mp4]/bv*",
         "-o", str(tmp / "%(id)s.%(ext)s"),
         url,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    ], timeout=900)
+    if proc is None:
+        return None
     files = [p for p in tmp.glob(f"{video_id}.*") if p.suffix not in (".part", ".ytdl")]
     if proc.returncode != 0 or not files:
         tail = (proc.stderr or "").strip()[-200:]
@@ -237,6 +264,8 @@ def main() -> int:
     ap.add_argument("--fps", type=int, choices=[30, 60], default=30, help="частота кадров")
     ap.add_argument("--per-query", type=int, default=30,
                     help="сколько результатов поиска смотреть на один запрос")
+    ap.add_argument("--check-per-query", type=int, default=15,
+                    help="сколько подходящих по длительности роликов на запрос проверять подробно")
     ap.add_argument("--any-license", action="store_true",
                     help="не фильтровать по CC BY (скачивать и обычные ролики YouTube — "
                          "проверьте права сами)")
@@ -263,11 +292,22 @@ def main() -> int:
     pools: list[tuple[str, list[dict]]] = []
     for q in QUERIES:
         log(f"\n🔎 {q}")
-        items = search(q, args.per_query)
-        good = [i for i in items
-                if is_good_candidate(i, args.any_license) and i.get("id") not in used_ids]
+        entries = search_flat(q, args.per_query)
+        pre = [e for e in entries
+               if e.get("id") and e["id"] not in used_ids and is_short_enough(e)]
+        to_check = pre[:args.check_per_query]
+        log(f"   найдено: {len(entries)}, по длительности подходят: {len(pre)}, "
+            f"проверяю полные данные: {len(to_check)}")
+        good: list[dict] = []
+        for k, entry in enumerate(to_check, 1):
+            info = fetch_info(entry["id"])
+            if info and is_good_candidate(info, args.any_license):
+                good.append(info)
+                log(f"   [{k}/{len(to_check)}] ✓ {(info.get('title') or '')[:60]}")
+            else:
+                log(f"   [{k}/{len(to_check)}] — не подходит")
         good.sort(key=quality_key, reverse=True)
-        log(f"   подходящих: {len(good)} из {len(items)}")
+        log(f"   подходящих: {len(good)}")
         pools.append((q, good))
 
     candidates = interleave(pools)
