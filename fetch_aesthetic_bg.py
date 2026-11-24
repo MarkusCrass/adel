@@ -4,64 +4,76 @@
 fetch_aesthetic_bg.py — автоматический поиск, скачивание и подготовка
 вертикальных эстетичных видеофонов для Reels (астрология / женский ресурс).
 
+Источник: Pexels (официальный API, лицензия Pexels License — бесплатно,
+в том числе для коммерческого использования; атрибуция не обязательна,
+но автора записываем в sources.json).
+
 Что делает:
-  1. Ищет короткие вертикальные ролики (#shorts) по английским запросам.
-  2. Отбирает кандидатов: длительность 10–60 с источника, кадр 9:16,
-     по умолчанию только лицензия Creative Commons Attribution (reuse allowed).
-  3. Скачивает их через `python -m yt_dlp`.
+  1. Ищет вертикальные (portrait) видео по англоязычным запросам.
+  2. Выбирает файлы MP4 с кадром 9:16 и шириной не меньше 1080 px.
+  3. Скачивает их во временную папку.
   4. Обрабатывает через ffmpeg (из пакета imageio-ffmpeg):
        • масштаб + кроп до точных 1080x1920;
        • 30 или 60 fps;
-       • 10–15 с (длиннее обрезается, из источника берётся начало);
+       • 10–15 с (длиннее обрезается, берётся начало);
        • звуковая дорожка удаляется (-an).
   5. Сохраняет результат как bg_01.mp4 … bg_15.mp4 и ведёт манифест
-     sources.json (ссылка, автор, лицензия — нужны для атрибуции CC BY).
+     sources.json (ссылка на видео, автор, лицензия).
 
-Установка зависимостей:
-    pip install yt-dlp imageio-ffmpeg
+Подготовка:
+    pip install imageio-ffmpeg
+    Бесплатный API-ключ: https://www.pexels.com/api/
+    Ключ передаётся через переменную окружения PEXELS_API_KEY.
+    Не вставляйте ключ в файлы и в Git.
+
+Windows PowerShell (на одну сессию):
+    $env:PEXELS_API_KEY = "ВАШ_КЛЮЧ"
+    python fetch_aesthetic_bg.py
 
 Запуск:
     python fetch_aesthetic_bg.py
     python fetch_aesthetic_bg.py --count 15 --fps 60 --out aesthetic_backgrounds
-    python fetch_aesthetic_bg.py --any-license      # снять фильтр лицензий (см. ниже)
 
 Повторный запуск безопасен: уже готовые bg_NN.mp4 и уже использованные
 видео из sources.json пропускаются.
 
-ВАЖНО о правах:
-  • Фильтр по CC BY — значение по умолчанию. Ролики под обычной
-    лицензией YouTube скачивать и публиковать как свой фон нельзя.
-  • CC BY требует указать автора. Используйте sources.json для титров.
-  • Скрипт не проверяет наличие текста и водяных знаков на кадре
-    автоматически — просмотрите готовые файлы перед публикацией.
+Проверьте готовые файлы глазами перед публикацией: скрипт не ищет текст
+и водяные знаки на кадре автоматически.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
-# Поисковые запросы (английские) + суффикс #shorts добавляется при поиске.
+API_URL = "https://api.pexels.com/videos/search"
+API_KEY_ENV = "PEXELS_API_KEY"
+
+# Запросы по теме: «aesthetic» и «no text» не используем — поиск Pexels ключевой,
+# вертикальность задаётся параметром orientation=portrait.
 QUERIES = [
-    "aesthetic full moon night sky vertical no text",
-    "aesthetic candle cozy evening rain vertical",
-    "aesthetic morning coffee sunlight calm vertical",
-    "aesthetic ocean waves night moonlight vertical",
+    "full moon night sky",
+    "candle cozy evening rain",
+    "morning coffee sunlight",
+    "ocean waves night moonlight",
 ]
 
-CC_LICENSE = "Creative Commons Attribution license (reuse allowed)"
 SRC_MIN_SEC = 10.0   # минимальная длительность источника
-SRC_MAX_SEC = 60.0   # Shorts не длиннее 60 с
 CLIP_MAX_SEC = 15.0  # итоговый фон: не длиннее 15 с (нижняя граница 10 с)
 OUT_W, OUT_H = 1080, 1920
 MANIFEST_NAME = "sources.json"
-SEARCH_ERRORS: list[str] = []  # ошибки поиска (сеть, yt-dlp)
+USER_AGENT = "fetch_aesthetic_bg/2.0"
+SEARCH_ERRORS: list[str] = []
 
 
 def log(msg: str) -> None:
@@ -69,134 +81,88 @@ def log(msg: str) -> None:
 
 
 def require_deps() -> str:
-    """Проверяет зависимости и возвращает путь к бинарнику ffmpeg."""
+    """Проверяет зависимости и ключ API; возвращает путь к бинарнику ffmpeg."""
     try:
         import imageio_ffmpeg
     except ImportError:
-        sys.exit("Не найден imageio-ffmpeg. Установите: pip install imageio-ffmpeg yt-dlp")
-
-    probe = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", "--version"],
-        capture_output=True, text=True,
-    )
-    if probe.returncode != 0:
-        sys.exit("Не найден yt-dlp для этого интерпретатора. Установите: pip install yt-dlp")
-
+        sys.exit("Не найден imageio-ffmpeg. Установите: pip install imageio-ffmpeg")
+    if not os.environ.get(API_KEY_ENV):
+        sys.exit(
+            f"Не задан API-ключ Pexels. Получите бесплатный ключ на https://www.pexels.com/api/\n"
+            f"и задайте переменную {API_KEY_ENV} (PowerShell: $env:{API_KEY_ENV} = \"ключ\")."
+        )
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def run_yt(args: list[str], timeout: int) -> subprocess.CompletedProcess | None:
-    """Запуск yt-dlp с таймаутом, чтобы скрипт не зависал на сетевых запросах."""
-    cmd = [sys.executable, "-m", "yt_dlp", "--no-warnings", "--ignore-errors", *args]
+def pexels_search(query: str, per_page: int, api_key: str) -> list[dict]:
+    """Поиск вертикальных видео по запросу. Возвращает список объектов видео из API."""
+    params = {"query": query, "orientation": "portrait", "per_page": per_page}
+    url = f"{API_URL}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"Authorization": api_key, "User-Agent": USER_AGENT})
     try:
-        return subprocess.run(cmd, capture_output=True, text=True,
-                              encoding="utf-8", timeout=timeout)
-    except subprocess.TimeoutExpired:
-        log("   ! yt-dlp не ответил за отведённое время, пропускаю")
-        return None
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data.get("videos", [])
+    except urllib.error.HTTPError as e:
+        hint = {401: "неверный ключ API", 403: "доступ запрещён", 429: "лимит запросов, попробуйте позже"}
+        msg = f"HTTP {e.code}: {hint.get(e.code, e.reason)}"
+        log(f"   ! поиск не удался ({msg})")
+        SEARCH_ERRORS.append(msg)
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+        msg = f"сеть: {e}"
+        log(f"   ! поиск не удался ({msg})")
+        SEARCH_ERRORS.append(msg)
+    return []
 
 
-def parse_json_lines(text: str) -> list[dict]:
-    items: list[dict] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
+def pick_file(video: dict) -> dict | None:
+    """Выбирает MP4-файл 9:16 с шириной от 1080 px (ближайший к 1080, иначе самый широкий)."""
+    best = None
+    best_key = None
+    for f in video.get("video_files", []):
+        if f.get("file_type") != "video/mp4":
             continue
-        try:
-            items.append(json.loads(line))
-        except json.JSONDecodeError:
+        w, h = int(f.get("width") or 0), int(f.get("height") or 0)
+        if not w or not h or h <= w:
             continue
-    return items
+        if not 1.5 <= h / w <= 2.1:  # 9:16 ≈ 1.78
+            continue
+        # ближайший ширина >= 1080 — лучший вариант; если нет — самый широкий
+        key = (0, w - OUT_W) if w >= OUT_W else (1, -w)
+        if best_key is None or key < best_key:
+            best, best_key = f, key
+    return best
 
 
-def search_flat(query: str, n: int) -> list[dict]:
-    """Быстрый поиск: только id, название и длительность (без полной загрузки каждого ролика)."""
-    proc = run_yt(["--flat-playlist", "--dump-json", f"ytsearch{n}:{query} #shorts"], timeout=180)
-    if proc is None:
-        return []
-    items = parse_json_lines(proc.stdout)
-    if proc.returncode != 0 and not items:
-        tail = (proc.stderr or "").strip()[-300:]
-        log(f"   ! поиск завершился с ошибкой: {tail}")
-        SEARCH_ERRORS.append(tail)
-    return items
-
-
-def fetch_info(video_id: str) -> dict | None:
-    """Полные метаданные одного ролика: размеры, лицензия."""
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    proc = run_yt(["--skip-download", "--dump-json", "--no-playlist", url], timeout=90)
-    if proc is None:
-        return None
-    items = parse_json_lines(proc.stdout)
-    return items[0] if items else None
-
-
-def is_short_enough(entry: dict) -> bool:
-    """Предварительный фильтр по длительности из быстрого поиска (если известна)."""
-    dur = entry.get("duration")
-    return dur is None or SRC_MIN_SEC <= float(dur) <= SRC_MAX_SEC
-
-
-def is_good_candidate(info: dict, any_license: bool) -> bool:
-    """Фильтр: длительность, вертикальный кадр, лицензия."""
-    if info.get("is_live") or info.get("was_live"):
-        return False
-
-    dur = float(info.get("duration") or 0)
-    if not SRC_MIN_SEC <= dur <= SRC_MAX_SEC:
-        return False
-
-    w = int(info.get("width") or 0)
-    h = int(info.get("height") or 0)
-    if not w or not h:
-        return False
-    if not 1.5 <= h / w <= 2.1:  # 9:16 ≈ 1.78
-        return False
-
-    if not any_license and info.get("license") != CC_LICENSE:
-        return False
-
-    return True
-
-
-def quality_key(info: dict) -> tuple:
-    """Сортировка «лучших»: сначала Full HD+, затем по просмотрам."""
-    return (int(info.get("height") or 0) >= 1080, int(info.get("view_count") or 0))
+def is_good_video(video: dict) -> bool:
+    return float(video.get("duration") or 0) >= SRC_MIN_SEC and pick_file(video) is not None
 
 
 def interleave(pools: list[tuple[str, list[dict]]]) -> list[tuple[str, dict]]:
-    """Чередует запросы (по одному ролику из каждого по кругу), без дублей."""
-    seen: set[str] = set()
+    """Чередует запросы по кругу, без дублей видео."""
+    seen: set[int] = set()
     result: list[tuple[str, dict]] = []
     depth = max((len(g) for _, g in pools), default=0)
     for i in range(depth):
         for query, good in pools:
             if i < len(good):
                 vid = good[i].get("id")
-                if vid and vid not in seen:
+                if vid is not None and vid not in seen:
                     seen.add(vid)
                     result.append((query, good[i]))
     return result
 
 
-def download(video_id: str, tmp: Path) -> Path | None:
-    """Скачивает видеодорожку (звук нам не нужен) во временную папку."""
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    proc = run_yt([
-        "--no-playlist",
-        "-f", "bv*[ext=mp4][height>=1080]/bv*[ext=mp4]/bv*",
-        "-o", str(tmp / "%(id)s.%(ext)s"),
-        url,
-    ], timeout=900)
-    if proc is None:
-        return None
-    files = [p for p in tmp.glob(f"{video_id}.*") if p.suffix not in (".part", ".ytdl")]
-    if proc.returncode != 0 or not files:
-        tail = (proc.stderr or "").strip()[-200:]
-        log(f"   ! загрузка не удалась: {tail}")
-        return None
-    return files[0]
+def download(url: str, dst: Path) -> bool:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp, open(dst, "wb") as out:
+            shutil.copyfileobj(resp, out)
+        return dst.stat().st_size > 0
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        log(f"   ! загрузка не удалась: {e}")
+        dst.unlink(missing_ok=True)
+        return False
 
 
 def make_background(ffmpeg: str, src: Path, dst: Path, duration: float, fps: int) -> bool:
@@ -258,26 +224,22 @@ def save_manifest(path: Path, items: list[dict]) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Скачать и подготовить 9:16 видеофоны для Reels.")
+    ap = argparse.ArgumentParser(description="Скачать и подготовить 9:16 видеофоны для Reels (Pexels).")
     ap.add_argument("--count", type=int, default=15, help="сколько фонов нужно (по умолчанию 15)")
     ap.add_argument("--out", default="aesthetic_backgrounds", help="папка для результата")
     ap.add_argument("--fps", type=int, choices=[30, 60], default=30, help="частота кадров")
-    ap.add_argument("--per-query", type=int, default=30,
-                    help="сколько результатов поиска смотреть на один запрос")
-    ap.add_argument("--check-per-query", type=int, default=15,
-                    help="сколько подходящих по длительности роликов на запрос проверять подробно")
-    ap.add_argument("--any-license", action="store_true",
-                    help="не фильтровать по CC BY (скачивать и обычные ролики YouTube — "
-                         "проверьте права сами)")
+    ap.add_argument("--per-query", type=int, default=40,
+                    help="сколько результатов поиска смотреть на один запрос (макс. 80)")
     args = ap.parse_args()
 
     ffmpeg = require_deps()
+    api_key = os.environ[API_KEY_ENV]
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     manifest_path = out / MANIFEST_NAME
     manifest = load_manifest(manifest_path)
-    used_ids = {m["video_id"] for m in manifest}
+    used_ids = {m["pexels_id"] for m in manifest}
 
     slots = [n for n in range(1, args.count + 1)
              if not (out / f"bg_{n:02d}.mp4").exists()]
@@ -286,28 +248,17 @@ def main() -> int:
         return 0
 
     log(f"Нужно создать фонов: {len(slots)} → {out}/")
-    log(f"Фильтр лицензии: {'отключён (--any-license)' if args.any_license else 'Creative Commons BY'}")
+    log("Источник: Pexels (лицензия Pexels License)")
 
     # 1. Поиск и фильтрация
     pools: list[tuple[str, list[dict]]] = []
     for q in QUERIES:
         log(f"\n🔎 {q}")
-        entries = search_flat(q, args.per_query)
-        pre = [e for e in entries
-               if e.get("id") and e["id"] not in used_ids and is_short_enough(e)]
-        to_check = pre[:args.check_per_query]
-        log(f"   найдено: {len(entries)}, по длительности подходят: {len(pre)}, "
-            f"проверяю полные данные: {len(to_check)}")
-        good: list[dict] = []
-        for k, entry in enumerate(to_check, 1):
-            info = fetch_info(entry["id"])
-            if info and is_good_candidate(info, args.any_license):
-                good.append(info)
-                log(f"   [{k}/{len(to_check)}] ✓ {(info.get('title') or '')[:60]}")
-            else:
-                log(f"   [{k}/{len(to_check)}] — не подходит")
-        good.sort(key=quality_key, reverse=True)
-        log(f"   подходящих: {len(good)}")
+        videos = pexels_search(q, min(max(args.per_query, 1), 80), api_key)
+        good = [v for v in videos
+                if v.get("id") is not None and v["id"] not in used_ids and is_good_video(v)]
+        good.sort(key=lambda v: float(v.get("duration") or 0), reverse=True)
+        log(f"   найдено: {len(videos)}, подходящих: {len(good)}")
         pools.append((q, good))
 
     candidates = interleave(pools)
@@ -316,16 +267,20 @@ def main() -> int:
     # 2. Скачивание и обработка
     tmp = Path(tempfile.mkdtemp(prefix=".tmp_bg_", dir=out))
     try:
-        for query, info in candidates:
+        for query, video in candidates:
             if not slots:
                 break
-            vid = info["id"]
-            title = (info.get("title") or "").strip()
-            duration = float(info.get("duration") or 0)
-            log(f"\n⬇ [{vid}] {title[:70]} ({duration:.0f} с)")
+            vid = video["id"]
+            duration = float(video.get("duration") or 0)
+            file_info = pick_file(video)
+            if file_info is None:
+                continue
+            user = video.get("user") or {}
+            log(f"\n⬇ [pexels {vid}] {user.get('name', '')} ({duration:.0f} с, "
+                f"{file_info.get('width')}x{file_info.get('height')})")
 
-            src = download(vid, tmp)
-            if src is None:
+            src = tmp / f"pexels_{vid}.mp4"
+            if not download(file_info["link"], src):
                 continue
 
             slot = slots[0]
@@ -339,11 +294,11 @@ def main() -> int:
             slots.pop(0)
             manifest.append({
                 "file": dst.name,
-                "video_id": vid,
-                "url": f"https://www.youtube.com/watch?v={vid}",
-                "title": title,
-                "channel": info.get("channel") or info.get("uploader") or "",
-                "license": info.get("license") or "",
+                "pexels_id": vid,
+                "url": video.get("url", ""),
+                "author": user.get("name", ""),
+                "author_url": user.get("url", ""),
+                "license": "Pexels License",
                 "source_duration_sec": duration,
                 "query": query,
             })
@@ -355,11 +310,9 @@ def main() -> int:
     log(f"\nГотово. Всего фонов в {out}/: {args.count - len(slots)} из {args.count}.")
     if slots:
         if SEARCH_ERRORS and not candidates:
-            log("Поиск на YouTube не работает (ошибка сети или устаревший yt-dlp). "
-                "Проверьте соединение и выполните: python -m pip install -U yt-dlp")
+            log("Поиск в Pexels не работает. Проверьте ключ PEXELS_API_KEY и соединение.")
         else:
-            log("Недостаточно подходящих роликов. Попробуйте --per-query 60, "
-                "--any-license (с проверкой прав) или расширьте QUERIES.")
+            log("Недостаточно подходящих видео. Попробуйте --per-query 80 или расширьте QUERIES.")
         return 1
     return 0
 
